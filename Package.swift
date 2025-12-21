@@ -1,4 +1,4 @@
-// swift-tools-version:5.3
+// swift-tools-version:5.9
 
 import PackageDescription
 
@@ -13,14 +13,16 @@ let package = Package(
             targets: ["QRScanner"]
         ),
     ],
-    dependencies: [],
     targets: [
         .target(
             name: "QRScanner",
-            dependencies: [],
             path: "QRScanner",
             exclude: [
                 "Info.plist",
+            ],
+            resources: [
+                .process("Images.xcassets"),
+                .copy("PrivacyInfo.xcprivacy"),
             ]
         ),
     ]
