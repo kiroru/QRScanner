@@ -83,21 +83,25 @@ public class QRScannerView: UIView {
 
     public func startRunning() {
         guard isAuthorized() else { return }
-        guard !session.isRunning else { return }
         videoDataOutputEnable = false
         metadataOutputEnable = true
-        metadataQueue.async { [weak self] in
-            self?.session.startRunning()
+        sessionQueue.async { [weak self] in
+            guard let self = self, !self.session.isRunning else { return }
+            self.session.startRunning()
         }
     }
 
     public func stopRunning() {
-        guard session.isRunning else { return }
-        videoDataQueue.async { [weak self] in
-            self?.session.stopRunning()
-        }
         metadataOutputEnable = false
         videoDataOutputEnable = false
+
+        // start/stopを同一キューで直列化し、メインスレッドで
+        // AVCaptureSessionの状態待ちが発生しないようにする。
+        let session = session
+        sessionQueue.async {
+            guard session.isRunning else { return }
+            session.stopRunning()
+        }
     }
 
     public func rescan() {
@@ -131,27 +135,46 @@ public class QRScannerView: UIView {
         if previewLayer?.frame != self.bounds {
             previewLayer?.frame = self.bounds
             blurEffectView.frame = self.bounds
-
-            let width = self.bounds.width * 0.618
-            let x = self.bounds.width * 0.191
-            let y = self.bounds.height * 0.191
-            focusImageView.frame = CGRect(x: x, y: y, width: width, height: width)
+            focusImageView.frame = focusImageFrame()
         }
+        updatePreviewOrientation()
     }
 
     deinit {
         setTorchActive(isOn: false)
         focusImageView.removeFromSuperview()
         qrCodeImageView.removeFromSuperview()
-        session.inputs.forEach { session.removeInput($0) }
-        session.outputs.forEach { session.removeOutput($0) }
         removePreviewLayer()
         torchActiveObservation = nil
+        if let sessionInterruptionObserver {
+            NotificationCenter.default.removeObserver(sessionInterruptionObserver)
+        }
+
+        // セッション停止後に同じキュー上で入出力を解放する。
+        // deinitを実行しているスレッド（通常はメイン）を待たせない。
+        let session = session
+        let metadataOutput = metadataOutput
+        let videoDataOutput = videoDataOutput
+        sessionQueue.async {
+            if session.isRunning {
+                session.stopRunning()
+            }
+
+            metadataOutput.setMetadataObjectsDelegate(nil, queue: nil)
+            videoDataOutput.setSampleBufferDelegate(nil, queue: nil)
+
+            session.beginConfiguration()
+            session.inputs.forEach { session.removeInput($0) }
+            session.outputs.forEach { session.removeOutput($0) }
+            session.commitConfiguration()
+        }
     }
 
     // MARK: - Private
 
     private weak var delegate: QRScannerViewDelegate?
+    /// AVCaptureSessionの開始・停止・解体を直列化する専用キュー
+    private let sessionQueue = DispatchQueue(label: "session.qrreader.queue")
     private let metadataQueue = DispatchQueue(label: "metadata.session.qrreader.queue")
     private let videoDataQueue = DispatchQueue(label: "videoData.session.qrreader.queue")
     private let session = AVCaptureSession()
@@ -163,7 +186,18 @@ public class QRScannerView: UIView {
     private var metadataOutputEnable = false
     private var videoDataOutputEnable = false
     private var torchActiveObservation: NSKeyValueObservation?
+    private var sessionInterruptionObserver: NSObjectProtocol?
     private var qrCodeImage: UIImage?
+
+    private var isIPad: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+    }
+
+    private enum Layout {
+        /// The inverse of the golden ratio, used to size the focus frame relative to the shorter view edge.
+        static let focusFrameSideRatio: CGFloat = 0.618
+    }
+
     private lazy var blurEffectView: UIVisualEffectView = {
         let blurEffectView = UIVisualEffectView(effect: UIBlurEffect(style: .light))
         blurEffectView.frame = self.bounds
@@ -224,6 +258,8 @@ public class QRScannerView: UIView {
 
         // commit session
         session.beginConfiguration()
+        configureMultitaskingCameraAccess()
+
         session.addInput(videoInput)
         metadataOutput.setMetadataObjectsDelegate(self, queue: metadataQueue)
         session.addOutput(metadataOutput)
@@ -234,6 +270,7 @@ public class QRScannerView: UIView {
         session.addOutput(videoDataOutput)
 
         session.commitConfiguration()
+        observeCaptureSessionInterruptions()
 
         // torch observation
         if videoDevice.hasTorch {
@@ -246,10 +283,66 @@ public class QRScannerView: UIView {
         if authorizationStatus() == .notDetermined {
             videoDataOutputEnable = false
             metadataOutputEnable = true
-            metadataQueue.async { [weak self] in
-                self?.session.startRunning()
+            sessionQueue.async { [weak self] in
+                guard let self = self, !self.session.isRunning else { return }
+                self.session.startRunning()
             }
         }
+    }
+
+    private func configureMultitaskingCameraAccess() {
+        guard isIPad else { return }
+        guard #available(iOS 16.0, *) else { return }
+
+        guard session.isMultitaskingCameraAccessSupported else {
+            print("[QRScanner] Multitasking camera access is not supported.")
+            return
+        }
+
+        session.isMultitaskingCameraAccessEnabled = true
+    }
+
+    private func observeCaptureSessionInterruptions() {
+        guard isIPad, sessionInterruptionObserver == nil else { return }
+
+        sessionInterruptionObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureSessionWasInterrupted,
+            object: session,
+            queue: .main
+        ) { [weak self] notification in
+            guard let reasonValue = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? Int,
+                  let reason = AVCaptureSession.InterruptionReason(rawValue: reasonValue) else {
+                print("[QRScanner] Capture session was interrupted. reason: unknown")
+                return
+            }
+
+            print("[QRScanner] Capture session was interrupted. reason: \(reasonValue) (\(reason))")
+
+            guard reason == .videoDeviceNotAvailableWithMultipleForegroundApps else { return }
+
+            self?.failure(.deviceFailure(.multitaskingCameraUnavailable))
+        }
+    }
+
+    private func updatePreviewOrientation() {
+        guard isIPad, let interfaceOrientation = window?.windowScene?.interfaceOrientation else { return }
+
+        let videoOrientation: AVCaptureVideoOrientation
+        switch interfaceOrientation {
+        case .portrait:
+            videoOrientation = .portrait
+        case .portraitUpsideDown:
+            videoOrientation = .portraitUpsideDown
+        case .landscapeLeft:
+            videoOrientation = .landscapeLeft
+        case .landscapeRight:
+            videoOrientation = .landscapeRight
+        default:
+            return
+        }
+
+        guard let connection = previewLayer?.connection, connection.isVideoOrientationSupported else { return }
+        connection.videoOrientation = videoOrientation
     }
 
     private func setupBlurEffectView() {
@@ -259,16 +352,30 @@ public class QRScannerView: UIView {
     }
 
     private func setupImageViews() {
-        let width = self.bounds.width * 0.618
-        let x = self.bounds.width * 0.191
-        let y = self.bounds.height * 0.191
-        focusImageView = UIImageView(frame: CGRect(x: x, y: y, width: width, height: width))
+        focusImageView = UIImageView(frame: focusImageFrame())
         focusImageView.image = focusImage ?? UIImage(named: "scan_qr_focus", in: .module, compatibleWith: nil)
         addSubview(focusImageView)
 
         qrCodeImageView = UIImageView()
         qrCodeImageView.contentMode = .scaleAspectFill
         addSubview(qrCodeImageView)
+    }
+
+    private func focusImageFrame() -> CGRect {
+        guard isIPad else {
+            let side = bounds.width * Layout.focusFrameSideRatio
+            let horizontalInset = (bounds.width - side) / 2
+            let verticalInset = bounds.height * (1 - Layout.focusFrameSideRatio) / 2
+            return CGRect(x: horizontalInset, y: verticalInset, width: side, height: side)
+        }
+
+        let side = min(bounds.width, bounds.height) * Layout.focusFrameSideRatio
+        return CGRect(
+            x: bounds.midX - side / 2,
+            y: bounds.midY - side / 2,
+            width: side,
+            height: side
+        )
     }
 
     private func addPreviewLayer() {
@@ -370,7 +477,9 @@ extension QRScannerView: AVCaptureMetadataOutputObjectsDelegate {
 
 extension QRScannerView: AVCaptureVideoDataOutputSampleBufferDelegate {
     public func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        connection.videoOrientation = .portrait
+        if !isIPad {
+            connection.videoOrientation = .portrait
+        }
         guard videoDataOutputEnable else { return }
         guard let qrCodeImage = getImageFromSampleBuffer(sampleBuffer: sampleBuffer) else { return }
 
